@@ -17,6 +17,7 @@ const (
 	MDPW_REPLY
 	MDPW_HEARTBEAT
 	MDPW_DISCONNECT
+	MDPW_ACK
 )
 
 var (
@@ -26,5 +27,6 @@ var (
 		MDPW_REPLY:      "REPLY",
 		MDPW_HEARTBEAT:  "HEARTBEAT",
 		MDPW_DISCONNECT: "DISCONNECT",
+		MDPW_ACK:        "ACK",
 	}
 )

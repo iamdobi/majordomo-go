@@ -219,6 +219,9 @@ func (mdwrk *Mdwrk) Recv(reply [][]byte) (msg [][]byte, err error) {
 			msg = msg[3:]
 			switch command {
 			case MDPW_REQUEST:
+				mdwrk.sendAck(msg[0])
+				msg = msg[1:]
+
 				//  We should pop and save as many addresses as there are
 				//  up to a null part, but for now, just save one...
 				var replyTob []byte
@@ -251,6 +254,14 @@ func (mdwrk *Mdwrk) Recv(reply [][]byte) (msg [][]byte, err error) {
 		}
 	}
 	return
+}
+
+func (mdwrk *Mdwrk) sendAck(pktid []byte) error {
+	if mdwrk.verbose {
+		log.Printf("W: worker send ack %s\n", pktid)
+	}
+	m := [][]byte{pktid}
+	return mdwrk.SendToBroker(MDPW_ACK, "", m)
 }
 
 //  Pops frame off front of message and returns it as 'head'

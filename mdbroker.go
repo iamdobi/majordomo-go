@@ -10,7 +10,11 @@ package majordomo
 //
 
 import (
+	"sync"
+
+	"github.com/iamdobi/majordomo-go/concurrent"
 	"github.com/iamdobi/majordomo-go/mdapi"
+	"github.com/iamdobi/majordomo-go/util"
 	zmq "github.com/pebbe/zmq4"
 
 	"fmt"
@@ -24,6 +28,7 @@ type Options struct {
 	heartbeatLiveness int
 	heartbeatInterval time.Duration
 	heartbeatExpiry   time.Duration
+	workerAckInterval time.Duration
 }
 
 type Option func(*Options)
@@ -37,6 +42,12 @@ func HeartbeatLiveness(heartbeatLiveness int) Option {
 func HeartbeatInterval(heartbeatInterval time.Duration) Option {
 	return func(args *Options) {
 		args.heartbeatInterval = heartbeatInterval
+	}
+}
+
+func WorkerAckInterval(workerAckInterval time.Duration) Option {
+	return func(args *Options) {
+		args.workerAckInterval = workerAckInterval
 	}
 }
 
@@ -54,10 +65,12 @@ type Broker struct {
 
 // Service The service class defines a single service instance:
 type Service struct {
-	broker   *Broker    //  Broker instance
-	name     string     //  Service name
-	requests [][][]byte //  List of client requests
-	waiting  []*Worker  //  List of waiting workers
+	broker *Broker //  Broker instance
+	name   string  //  Service name
+	// requests [][][]byte //  List of client requests
+	requests concurrent.List // List<[][]byte>
+	waiting  []*Worker       //  List of waiting workers
+	ackMap   *sync.Map
 }
 
 // Worker The worker class defines a single worker, idle or active:
@@ -74,10 +87,12 @@ func NewBroker(verbose bool, setters ...Option) (broker *Broker, err error) {
 	// Default Options
 	heartbeatLiveness := 3
 	heartbeatInterval := 2500 * time.Millisecond
+	workerAckInterval := 2500 * time.Millisecond
 	args := &Options{
 		heartbeatLiveness: heartbeatLiveness,
 		heartbeatInterval: heartbeatInterval,
 		heartbeatExpiry:   time.Duration(heartbeatLiveness) * heartbeatInterval,
+		workerAckInterval: workerAckInterval,
 	}
 
 	for _, setter := range setters {
@@ -143,6 +158,9 @@ func (broker *Broker) WorkerMsg(senderb []byte, msg [][]byte) {
 	switch command {
 	case mdapi.MDPW_READY:
 		if worker_ready { //  Not first command in session
+			if broker.verbose {
+				log.Printf("D: worker [%s] is deleted with mdapi.MDPW_READY\n", id_string)
+			}
 			worker.Delete(true)
 		} else if len(sender) >= 4 /*  Reserved service name */ && sender[:4] == "mmi." {
 			worker.Delete(true)
@@ -151,6 +169,12 @@ func (broker *Broker) WorkerMsg(senderb []byte, msg [][]byte) {
 			worker.service = broker.ServiceRequire(string(msg[0]))
 			worker.Waiting()
 		}
+	case mdapi.MDPW_ACK:
+		pktid := string(msg[0])
+		if broker.verbose {
+			log.Printf("D: ack from [%s], pktid=%s\n", id_string, pktid)
+		}
+		worker.service.processAck(pktid)
 	case mdapi.MDPW_REPLY:
 		if worker_ready {
 			//  Remove & save client return envelope and insert the
@@ -159,12 +183,18 @@ func (broker *Broker) WorkerMsg(senderb []byte, msg [][]byte) {
 			broker.socket.SendMessage(client, "", mdapi.MDPC_CLIENT, worker.service.name, msg)
 			worker.Waiting()
 		} else {
+			if broker.verbose {
+				log.Printf("D: worker [%s] is deleted with mdapi.MDPW_REPLY\n", id_string)
+			}
 			worker.Delete(true)
 		}
 	case mdapi.MDPW_HEARTBEAT:
 		if worker_ready {
 			worker.expiry = time.Now().Add(broker.options.heartbeatExpiry)
 		} else {
+			if broker.verbose {
+				log.Printf("D: worker [%s] is deleted with mdapi.MDPW_HEARTBEAT\n", id_string)
+			}
 			worker.Delete(true)
 		}
 	case mdapi.MDPW_DISCONNECT:
@@ -250,8 +280,9 @@ func (broker *Broker) ServiceRequire(service_frame string) (service *Service) {
 		service = &Service{
 			broker:   broker,
 			name:     name,
-			requests: make([][][]byte, 0),
+			requests: concurrent.NewConcurrentList(),
 			waiting:  make([]*Worker, 0),
+			ackMap:   &sync.Map{},
 		}
 		broker.services[name] = service
 		if broker.verbose {
@@ -265,17 +296,45 @@ func (broker *Broker) ServiceRequire(service_frame string) (service *Service) {
 func (service *Service) Dispatch(msg [][]byte) {
 	if len(msg) > 0 {
 		//  Queue message if any
-		service.requests = append(service.requests, msg)
+		service.requests.Add(msg)
 	}
 
 	service.broker.Purge()
-	for len(service.waiting) > 0 && len(service.requests) > 0 {
+	for len(service.waiting) > 0 && service.requests.Len() > 0 {
 		var worker *Worker
 		worker, service.waiting = popWorker(service.waiting)
 		service.broker.waiting = delWorker(service.broker.waiting, worker)
-		msg, service.requests = popMsgBytes(service.requests)
-		worker.Send(mdapi.MDPW_REQUEST, "", msg)
+		service.dispatchInner(msg, worker)
 	}
+}
+
+// Provide waiting for ACK from worker.
+// If ACK is not receivable, msg should be returned to requests queue, to be processed later.
+func (service *Service) dispatchInner(msg [][]byte, worker *Worker) {
+	msg = popMsgBytes(service.requests)
+	pktid := util.RandString(16)
+	pktidb := []byte(pktid)
+	msg = append([][]byte{pktidb}, msg...)
+	service.ackMap.Store(pktid, 1)
+	worker.Send(mdapi.MDPW_REQUEST, "", msg)
+
+	go func(pktid string, worker *Worker) {
+		<-time.NewTicker(service.broker.options.workerAckInterval).C
+		_, ok := service.ackMap.Load(pktid)
+		if ok {
+			// ack is not come.
+			if service.broker.verbose {
+				log.Printf("D: ack is not come [%s] from worker [%s]\n", pktid, worker.id_string)
+			}
+
+			service.ackMap.Delete(pktid)
+			service.Dispatch(msg[1:])
+		}
+	}(pktid, worker)
+}
+
+func (service *Service) processAck(pktid string) {
+	service.ackMap.Delete(pktid)
 }
 
 // Here is the implementation of the methods that work on a worker:
@@ -283,7 +342,6 @@ func (service *Service) Dispatch(msg [][]byte) {
 // WorkerRequire Lazy constructor that locates a worker by identity, or creates a new
 // worker if there is no worker already with that identity.
 func (broker *Broker) WorkerRequire(identity string) (worker *Worker) {
-
 	//  broker.workers is keyed off worker identity
 	id_string := fmt.Sprintf("%q", identity)
 	worker, ok := broker.workers[id_string]
@@ -370,10 +428,8 @@ func popBytes(ss [][]byte) (s []byte, ss2 [][]byte) {
 	return
 }
 
-func popMsgBytes(msgs [][][]byte) (msg [][]byte, msgs2 [][][]byte) {
-	msg = msgs[0]
-	msgs2 = msgs[1:]
-	return
+func popMsgBytes(msgs concurrent.List) (msg [][]byte) {
+	return msgs.RemoveAt(0).([][]byte)
 }
 
 func popWorker(workers []*Worker) (worker *Worker, workers2 []*Worker) {
@@ -447,47 +503,3 @@ func StartBroker(port int, verbose bool, setters ...Option) *Broker {
 
 	return broker
 }
-
-// func startWorker(verbose bool) {
-// 	session, _ := mdapi.NewMdwrk("tcp://localhost:5555", "echo", verbose)
-
-// 	var err error
-// 	var request, reply [][]byte
-// 	for {
-// 		request, err = session.Recv(reply)
-// 		if err != nil {
-// 			break //  Worker was interrupted
-// 		}
-// 		reply = request //  Echo is complex... :-)
-// 		log.Printf("[worker] reply=%v\n", reply)
-// 	}
-// 	log.Println(err)
-// }
-
-// func startClient(verbose bool) {
-// 	session, _ := mdapi.NewMdcli("tcp://localhost:5555", verbose)
-
-// 	count := 0
-// 	for ; count < 10; count++ {
-// 		reply, err := session.Send("echo", []byte("Hello world"))
-// 		if err != nil {
-// 			log.Println(err)
-// 			break //  Interrupt or failure
-// 		} else {
-// 			log.Printf("[client] reply=%v\n", string(reply[0]))
-// 		}
-// 	}
-// 	log.Printf("%d requests/replies processed\n", count)
-// }
-
-// func main() {
-// 	go startBroker(true)
-// 	go startWorker(true)
-
-// 	time.Sleep(time.Second * 2)
-
-// 	go startClient(true)
-
-// 	ch := make(chan bool)
-// 	<-ch
-// }

@@ -2,7 +2,7 @@ package majordomo_test
 
 import (
 	"fmt"
-	"log"
+	"sync"
 	"testing"
 	"time"
 
@@ -64,6 +64,66 @@ func TestReqRep(t *testing.T) {
 	time.Sleep(500 * time.Millisecond) // time to release
 }
 
+func TestMissingWorker(t *testing.T) {
+	// prepare broker
+	port := 5552
+	verbose := false
+	broker := startBroker(port, verbose, md.HeartbeatInterval(200*time.Millisecond), md.WorkerAckInterval(200*time.Millisecond))
+
+	// prepare worker
+	workerNum := 3
+	var workers []*mdapi.Mdwrk
+	for i := 0; i < workerNum; i++ {
+		workers = append(workers, startWorker(port, verbose, mdapi.HeartbeatInterval(200*time.Millisecond)))
+	}
+	time.Sleep(10 * time.Millisecond)
+	delWorker := workers[len(workers)-1]
+	workers = workers[0 : len(workers)-1]
+	delWorker.Close()
+
+	// prepare clients
+	done := make(chan bool)
+	errChan := make(chan error)
+	var wg sync.WaitGroup
+	wg.Add(workerNum)
+	for i := 0; i < workerNum; i++ {
+		go func() {
+			cliapi, err := mdapi.NewMdcli(fmt.Sprintf("tcp://localhost:%d", port), verbose)
+			if err != nil {
+				errChan <- err
+				return
+			}
+			cliapi.SetTimeout(1000 * time.Second) // don't use timeout
+			_, err = cliapi.Send("echo", []byte("hello"))
+			if err != nil {
+				errChan <- err
+				return
+			}
+			wg.Done()
+		}()
+	}
+
+	go func() {
+		wg.Wait()
+		done <- true
+	}()
+
+	// check whether all requests is done
+	select {
+	case <-done:
+		break
+	case err := <-errChan:
+		t.Error(err)
+	case <-time.NewTicker(1200 * time.Millisecond).C:
+		t.Error("request hagned...")
+	}
+
+	for _, worker := range workers {
+		worker.Close()
+	}
+	broker.Close()
+}
+
 func startBroker(port int, verbose bool, setters ...md.Option) *md.Broker {
 	broker := md.StartBroker(port, verbose, setters...)
 	return broker
@@ -81,8 +141,8 @@ func startWorker(port int, verbose bool, setters ...mdapi.Option) *mdapi.Mdwrk {
 				fmt.Printf("worker interrupted..\n")
 				break //  Worker was interrupted
 			}
+			time.Sleep(100 * time.Millisecond)
 			reply = request //  Echo is complex... :-)
-			log.Printf("[worker] reply=%v\n", reply)
 		}
 	}(session)
 
