@@ -15,6 +15,33 @@ const (
 	heartbeat_liveness = 3 //  3-5 is reasonable
 )
 
+// Options worker options
+type Options struct {
+	heartbeatLiveness int
+	heartbeatInterval time.Duration
+	reconnectInterval time.Duration
+}
+
+type Option func(*Options)
+
+func HeartbeatLiveness(heartbeatLiveness int) Option {
+	return func(args *Options) {
+		args.heartbeatLiveness = heartbeatLiveness
+	}
+}
+
+func HeartbeatInterval(heartbeatInterval time.Duration) Option {
+	return func(args *Options) {
+		args.heartbeatInterval = heartbeatInterval
+	}
+}
+
+func ReconnectInterval(reconnectInterval time.Duration) Option {
+	return func(args *Options) {
+		args.reconnectInterval = reconnectInterval
+	}
+}
+
 //  This is the structure of a worker API instance. We use a pseudo-OO
 //  approach in a lot of the C examples, as well as the CZMQ binding:
 
@@ -27,13 +54,12 @@ type Mdwrk struct {
 	service string
 	worker  *zmq.Socket //  Socket to broker
 	poller  *zmq.Poller
+	options *Options
 	verbose bool //  Print activity to stdout
 
 	//  Heartbeat management
-	heartbeat_at time.Time     //  When to send HEARTBEAT
-	liveness     int           //  How many attempts left
-	heartbeat    time.Duration //  Heartbeat delay, msecs
-	reconnect    time.Duration //  Reconnect delay, msecs
+	heartbeat_at time.Time //  When to send HEARTBEAT
+	liveness     int       //  How many attempts left
 
 	expect_reply bool   //  False only at start
 	reply_to     string //  Return identity, if any
@@ -89,8 +115,8 @@ func (mdwrk *Mdwrk) ConnectToBroker() (err error) {
 	err = mdwrk.SendToBroker(MDPW_READY, mdwrk.service, [][]byte{})
 
 	//  If liveness hits zero, queue is considered disconnected
-	mdwrk.liveness = heartbeat_liveness
-	mdwrk.heartbeat_at = time.Now().Add(mdwrk.heartbeat)
+	mdwrk.liveness = mdwrk.options.heartbeatLiveness
+	mdwrk.heartbeat_at = time.Now().Add(mdwrk.options.heartbeatInterval)
 
 	return
 }
@@ -99,14 +125,23 @@ func (mdwrk *Mdwrk) ConnectToBroker() (err error) {
 
 //  ---------------------------------------------------------------------
 //  NewMdwrk Constructor
-func NewMdwrk(broker, service string, verbose bool) (mdwrk *Mdwrk, err error) {
+func NewMdwrk(broker, service string, verbose bool, setters ...Option) (mdwrk *Mdwrk, err error) {
+	// Default Options
+	args := &Options{
+		heartbeatLiveness: 3,
+		heartbeatInterval: 2500 * time.Millisecond,
+		reconnectInterval: 2500 * time.Millisecond,
+	}
+
+	for _, setter := range setters {
+		setter(args)
+	}
 
 	mdwrk = &Mdwrk{
-		broker:    broker,
-		service:   service,
-		verbose:   verbose,
-		heartbeat: 2500 * time.Millisecond,
-		reconnect: 2500 * time.Millisecond,
+		broker:  broker,
+		service: service,
+		verbose: verbose,
+		options: args,
 	}
 
 	err = mdwrk.ConnectToBroker()
@@ -124,23 +159,6 @@ func (mdwrk *Mdwrk) Close() {
 		mdwrk.worker.Close()
 		mdwrk.worker = nil
 	}
-}
-
-//  We provide two methods to configure the worker API. You can set the
-//  heartbeat interval and retries to match the expected network performance.
-
-//  ---------------------------------------------------------------------
-
-//  SetHeartbeat Set heartbeat delay.
-func (mdwrk *Mdwrk) SetHeartbeat(heartbeat time.Duration) {
-	mdwrk.heartbeat = heartbeat
-}
-
-//  ---------------------------------------------------------------------
-
-//  SetReconnect Set reconnect delay.
-func (mdwrk *Mdwrk) SetReconnect(reconnect time.Duration) {
-	mdwrk.reconnect = reconnect
 }
 
 //  This is the recv method; it's a little misnamed since it first sends
@@ -169,7 +187,7 @@ func (mdwrk *Mdwrk) Recv(reply [][]byte) (msg [][]byte, err error) {
 
 	for {
 		var polled []zmq.Polled
-		polled, err = mdwrk.poller.Poll(mdwrk.heartbeat)
+		polled, err = mdwrk.poller.Poll(mdwrk.options.heartbeatInterval)
 		if err != nil {
 			break //  Interrupted
 		}
@@ -182,7 +200,7 @@ func (mdwrk *Mdwrk) Recv(reply [][]byte) (msg [][]byte, err error) {
 			if mdwrk.verbose {
 				log.Printf("I: received message from broker: %q\n", msg)
 			}
-			mdwrk.liveness = heartbeat_liveness
+			mdwrk.liveness = mdwrk.options.heartbeatLiveness
 
 			//  Don't try to handle errors, just assert noisily
 			if len(msg) < 3 {
@@ -222,14 +240,14 @@ func (mdwrk *Mdwrk) Recv(reply [][]byte) (msg [][]byte, err error) {
 				if mdwrk.verbose {
 					log.Println("W: disconnected from broker - retrying...")
 				}
-				time.Sleep(mdwrk.reconnect)
+				time.Sleep(mdwrk.options.reconnectInterval)
 				mdwrk.ConnectToBroker()
 			}
 		}
 		//  Send HEARTBEAT if it's time
 		if time.Now().After(mdwrk.heartbeat_at) {
 			mdwrk.SendToBroker(MDPW_HEARTBEAT, "", [][]byte{})
-			mdwrk.heartbeat_at = time.Now().Add(mdwrk.heartbeat)
+			mdwrk.heartbeat_at = time.Now().Add(mdwrk.options.heartbeatInterval)
 		}
 	}
 	return
