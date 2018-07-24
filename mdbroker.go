@@ -19,13 +19,26 @@ import (
 	"time"
 )
 
-const (
-	//  We'd normally pull these from config data
+// Options broker options
+type Options struct {
+	heartbeatLiveness int
+	heartbeatInterval time.Duration
+	heartbeatExpiry   time.Duration
+}
 
-	HEARTBEAT_LIVENESS = 3                       //  3-5 is reasonable
-	HEARTBEAT_INTERVAL = 2500 * time.Millisecond //  msecs
-	HEARTBEAT_EXPIRY   = HEARTBEAT_INTERVAL * HEARTBEAT_LIVENESS
-)
+type Option func(*Options)
+
+func HeartbeatLiveness(heartbeatLiveness int) Option {
+	return func(args *Options) {
+		args.heartbeatLiveness = heartbeatLiveness
+	}
+}
+
+func HeartbeatInterval(heartbeatInterval time.Duration) Option {
+	return func(args *Options) {
+		args.heartbeatInterval = heartbeatInterval
+	}
+}
 
 // Broker The broker class defines a single broker instance:
 type Broker struct {
@@ -35,6 +48,7 @@ type Broker struct {
 	services     map[string]*Service //  Hash of known services
 	workers      map[string]*Worker  //  Hash of known workers
 	waiting      []*Worker           //  List of waiting workers
+	options      *Options            //  Options
 	heartbeat_at time.Time           //  When to send HEARTBEAT
 }
 
@@ -56,7 +70,20 @@ type Worker struct {
 }
 
 // NewBroker Here are the constructor and destructor for the broker:
-func NewBroker(verbose bool) (broker *Broker, err error) {
+func NewBroker(verbose bool, setters ...Option) (broker *Broker, err error) {
+	// Default Options
+	heartbeatLiveness := 3
+	heartbeatInterval := 2500 * time.Millisecond
+	args := &Options{
+		heartbeatLiveness: heartbeatLiveness,
+		heartbeatInterval: heartbeatInterval,
+		heartbeatExpiry:   time.Duration(heartbeatLiveness) * heartbeatInterval,
+	}
+
+	for _, setter := range setters {
+		setter(args)
+	}
+	args.heartbeatExpiry = time.Duration(args.heartbeatLiveness) * args.heartbeatInterval
 
 	//  Initialize broker state
 	broker = &Broker{
@@ -64,7 +91,8 @@ func NewBroker(verbose bool) (broker *Broker, err error) {
 		services:     make(map[string]*Service),
 		workers:      make(map[string]*Worker),
 		waiting:      make([]*Worker, 0),
-		heartbeat_at: time.Now().Add(HEARTBEAT_INTERVAL),
+		options:      args,
+		heartbeat_at: time.Now().Add(args.heartbeatInterval),
 	}
 	broker.socket, err = zmq.NewSocket(zmq.ROUTER)
 
@@ -135,7 +163,7 @@ func (broker *Broker) WorkerMsg(senderb []byte, msg [][]byte) {
 		}
 	case mdapi.MDPW_HEARTBEAT:
 		if worker_ready {
-			worker.expiry = time.Now().Add(HEARTBEAT_EXPIRY)
+			worker.expiry = time.Now().Add(broker.options.heartbeatExpiry)
 		} else {
 			worker.Delete(true)
 		}
@@ -196,15 +224,19 @@ func (broker *Broker) ClientMsg(senderb []byte, msg [][]byte) {
 // workers (since we call this method in our critical path):
 func (broker *Broker) Purge() {
 	now := time.Now()
-	for len(broker.waiting) > 0 {
-		if broker.waiting[0].expiry.After(now) {
-			break //  Worker is alive, we're done here
+	for i := len(broker.waiting) - 1; i >= 0; i-- {
+		if broker.waiting[i].expiry.After(now) {
+			continue
 		}
 		if broker.verbose {
-			log.Println("I: deleting expired worker:", broker.waiting[0].id_string)
+			log.Println("I: deleting expired worker:", broker.waiting[i].id_string)
 		}
-		broker.waiting[0].Delete(false)
+		broker.waiting[i].Delete(false)
 	}
+}
+
+func (broker *Broker) WorkerLen() int {
+	return len(broker.waiting)
 }
 
 //  Here is the implementation of the methods that work on a service:
@@ -315,7 +347,7 @@ func (worker *Worker) Waiting() {
 	//  Queue to broker and service waiting lists
 	worker.broker.waiting = append(worker.broker.waiting, worker)
 	worker.service.waiting = append(worker.service.waiting, worker)
-	worker.expiry = time.Now().Add(HEARTBEAT_EXPIRY)
+	worker.expiry = time.Now().Add(worker.broker.options.heartbeatExpiry)
 	worker.service.Dispatch([][]byte{})
 }
 
@@ -362,54 +394,58 @@ func delWorker(workers []*Worker, worker *Worker) []*Worker {
 
 // StartBroker Finally here is the main task. We create a new broker instance and
 // then processes messages on the broker socket:
-func StartBroker(port int, verbose bool) {
-	broker, _ := NewBroker(verbose)
+func StartBroker(port int, verbose bool, setters ...Option) *Broker {
+	broker, _ := NewBroker(verbose, setters...)
 	broker.Bind(fmt.Sprintf("tcp://*:%d", port))
 
-	poller := zmq.NewPoller()
-	poller.Add(broker.socket, zmq.POLLIN)
+	go func(broker *Broker) {
+		poller := zmq.NewPoller()
+		poller.Add(broker.socket, zmq.POLLIN)
 
-	//  Get and process messages forever or until interrupted
-	for {
-		polled, err := poller.Poll(HEARTBEAT_INTERVAL)
-		if err != nil {
-			break //  Interrupted
-		}
-
-		//  Process next input message, if any
-		if len(polled) > 0 {
-			msg, err := broker.socket.RecvMessageBytes(0)
+		//  Get and process messages forever or until interrupted
+		for {
+			polled, err := poller.Poll(broker.options.heartbeatInterval)
 			if err != nil {
 				break //  Interrupted
 			}
-			if broker.verbose {
-				log.Printf("I: received message: %q\n", msg)
-			}
-			sender, msg := popBytes(msg)
-			_, msg = popBytes(msg)
-			headerb, msg := popBytes(msg)
-			header := string(headerb)
 
-			switch header {
-			case mdapi.MDPC_CLIENT:
-				broker.ClientMsg(sender, msg)
-			case mdapi.MDPW_WORKER:
-				broker.WorkerMsg(sender, msg)
-			default:
-				log.Printf("E: invalid message: %q\n", msg)
+			//  Process next input message, if any
+			if len(polled) > 0 {
+				msg, err := broker.socket.RecvMessageBytes(0)
+				if err != nil {
+					break //  Interrupted
+				}
+				if broker.verbose {
+					log.Printf("I: received message: %q\n", msg)
+				}
+				sender, msg := popBytes(msg)
+				_, msg = popBytes(msg)
+				headerb, msg := popBytes(msg)
+				header := string(headerb)
+
+				switch header {
+				case mdapi.MDPC_CLIENT:
+					broker.ClientMsg(sender, msg)
+				case mdapi.MDPW_WORKER:
+					broker.WorkerMsg(sender, msg)
+				default:
+					log.Printf("E: invalid message: %q\n", msg)
+				}
+			}
+			//  Disconnect and delete any expired workers
+			//  Send heartbeats to idle workers if needed
+			if time.Now().After(broker.heartbeat_at) {
+				broker.Purge()
+				for _, worker := range broker.waiting {
+					worker.Send(mdapi.MDPW_HEARTBEAT, "", [][]byte{})
+				}
+				broker.heartbeat_at = time.Now().Add(broker.options.heartbeatInterval)
 			}
 		}
-		//  Disconnect and delete any expired workers
-		//  Send heartbeats to idle workers if needed
-		if time.Now().After(broker.heartbeat_at) {
-			broker.Purge()
-			for _, worker := range broker.waiting {
-				worker.Send(mdapi.MDPW_HEARTBEAT, "", [][]byte{})
-			}
-			broker.heartbeat_at = time.Now().Add(HEARTBEAT_INTERVAL)
-		}
-	}
-	log.Println("W: interrupt received, shutting down...")
+		log.Println("W: interrupt received, shutting down...")
+	}(broker)
+
+	return broker
 }
 
 // func startWorker(verbose bool) {
